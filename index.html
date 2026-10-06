@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>音声日報</title>
+<style>
+  :root{--main:#2b6cb0;--rec:#e53e3e;--bg:#f5f7fa;--card:#fff;--text:#1a202c;--sub:#718096;--line:#e2e8f0}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;background:var(--bg);color:var(--text)}
+  .wrap{max-width:480px;margin:0 auto;padding:16px}
+  h1{font-size:20px;margin:8px 0 16px}
+  .card{background:var(--card);border-radius:12px;padding:16px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+  label.lbl{display:block;font-size:13px;color:var(--sub);margin-bottom:6px}
+  select{width:100%;font-size:16px;padding:12px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--text);-webkit-appearance:none;appearance:none}
+  .field+.field{margin-top:14px}
+  .rec-area{text-align:center}
+  #recBtn{width:120px;height:120px;border-radius:50%;border:none;background:var(--rec);color:#fff;font-size:17px;font-weight:bold;box-shadow:0 4px 12px rgba(229,62,62,.35);cursor:pointer;-webkit-tap-highlight-color:transparent}
+  #recBtn.recording{background:#c53030;animation:pulse 1.2s infinite}
+  #recBtn:disabled{background:#a0aec0;box-shadow:none;animation:none}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(229,62,62,.6)}70%{box-shadow:0 0 0 18px rgba(229,62,62,0)}100%{box-shadow:0 0 0 0 rgba(229,62,62,0)}}
+  #timer{font-size:28px;font-variant-numeric:tabular-nums;margin:12px 0 4px}
+  .hint{font-size:12px;color:var(--sub);line-height:1.6}
+  audio{width:100%;margin-top:12px}
+  .btn{width:100%;padding:14px;font-size:16px;font-weight:bold;border:none;border-radius:8px;background:var(--main);color:#fff;cursor:pointer}
+  .btn:disabled{background:#a0aec0}
+  .link{display:inline-block;color:var(--main);font-size:14px;text-decoration:underline;padding:10px;cursor:pointer}
+  .link.disabled{color:#a0aec0;pointer-events:none}
+  #msg{white-space:pre-wrap;font-size:14px;line-height:1.7;margin-top:12px}
+  #msg:empty{display:none}
+  .ok{color:#276749}.err{color:#c53030}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>音声日報</h1>
+
+  <div class="card">
+    <div class="field">
+      <label class="lbl" for="staff">提出者</label>
+      <select id="staff"><option value="">読み込み中…</option></select>
+    </div>
+    <div class="field">
+      <label class="lbl" for="venue">施設・部門</label>
+      <select id="venue"><option value="">読み込み中…</option></select>
+    </div>
+  </div>
+
+  <div class="card rec-area">
+    <button id="recBtn" onclick="toggleRec()">録音</button>
+    <div id="timer">0:00</div>
+    <div class="hint">今日の業務内容・トラブル・施設からの要望や指摘などを話してください（最大5分）<br>録音中は画面を閉じたりロックしたりしないでください</div>
+    <audio id="player" controls hidden></audio>
+    <div>
+      <label id="fileBtn" class="link" for="file">保存済みの音声ファイルを選ぶ</label>
+      <input type="file" id="file" accept="audio/*" hidden onchange="pickFile(this)">
+    </div>
+  </div>
+
+  <div class="card">
+    <button id="sendBtn" class="btn" onclick="send()" disabled>送信する</button>
+    <div id="msg"></div>
+  </div>
+</div>
+
+<script>
+  /* ▼ GASのウェブアプリURL（/exec で終わるもの）を貼り付け */
+  const GAS_URL = 'https://script.google.com/a/macros/deliart.com/s/AKfycbzppx0LmZyXHdDJ5TZwp1sCSUSCQ5WcW6-EzAJZKm59vBdZyi9u8xbcJzF23TMF993_/exec';
+
+  const MAX_SEC = 300;
+  const MAX_BYTES = 15 * 1024 * 1024;
+  const DEPT_ORDER = ['客室清掃', 'スチュワード', 'パブリック清掃'];
+  const $ = id => document.getElementById(id);
+
+  let KEY = '';
+  let recorder = null, stream = null, chunks = [], audioBlob = null, timerId = null, startAt = 0, busy = false;
+
+  /* ---- 起動 ---- */
+  (async function start() {
+    KEY = new URLSearchParams(location.search).get('key') || load('key') || '';
+    if (KEY) store('key', KEY);
+    if (!KEY) { showMsg('配布されたURLから開いてください。', 'err'); return; }
+
+    try {
+      const res = await fetch(`${GAS_URL}?action=master&key=${encodeURIComponent(KEY)}`);
+      const m = await res.json();
+      if (!m.ok) throw new Error(m.error);
+      init(m);
+    } catch (e) {
+      showMsg('読み込みに失敗しました：' + e.message, 'err');
+    }
+  })();
+
+  function init(m) {
+    const staffSel = $('staff');
+    staffSel.innerHTML = '<option value="">選択してください</option>' +
+      m.staff.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
+
+    const venueSel = $('venue');
+    const depts = [...new Set(m.venues.map(v => v.dept))].sort((a, b) => idx(a) - idx(b));
+    venueSel.innerHTML = '<option value="">選択してください</option>' +
+      depts.map(d =>
+        `<optgroup label="${esc(d)}">` +
+        m.venues.filter(v => v.dept === d)
+          .map(v => `<option value="${esc(v.code)}">${esc(v.name)}（${esc(v.dept)}）</option>`).join('') +
+        '</optgroup>'
+      ).join('');
+
+    restore('staff'); restore('venue');
+    staffSel.onchange = () => { store('staff', staffSel.value); updateUI(); };
+    venueSel.onchange = () => { store('venue', venueSel.value); updateUI(); };
+    updateUI();
+  }
+
+  function idx(d) { const i = DEPT_ORDER.indexOf(d); return i < 0 ? 99 : i; }
+
+  /* ---- 録音 ---- */
+  async function toggleRec() {
+    if (recorder && recorder.state === 'recording') { recorder.stop(); return; }
+
+    if (!navigator.mediaDevices || !window.MediaRecorder) {
+      showMsg('このブラウザでは録音できません。「保存済みの音声ファイルを選ぶ」から送信してください。', 'err');
+      return;
+    }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      showMsg('マイクを使用できませんでした。ブラウザの設定でマイクを許可してください。', 'err');
+      return;
+    }
+
+    const type = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg;codecs=opus']
+      .find(t => MediaRecorder.isTypeSupported(t)) || '';
+    recorder = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+    chunks = [];
+    recorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+    recorder.onstop = () => {
+      stream.getTracks().forEach(t => t.stop());
+      clearInterval(timerId);
+      setAudio(new Blob(chunks, { type: recorder.mimeType || type || 'audio/webm' }));
+      $('recBtn').classList.remove('recording');
+      $('recBtn').textContent = '録り直す';
+      updateUI();
+    };
+
+    resetAudio(false);
+    recorder.start(1000);
+    startAt = Date.now();
+    tick();
+    timerId = setInterval(tick, 250);
+    $('recBtn').classList.add('recording');
+    $('recBtn').textContent = '停止';
+    showMsg('');
+    updateUI();
+  }
+
+  function tick() {
+    const sec = Math.floor((Date.now() - startAt) / 1000);
+    $('timer').textContent = fmt(sec);
+    if (sec >= MAX_SEC && recorder && recorder.state === 'recording') recorder.stop();
+  }
+
+  function pickFile(input) {
+    const f = input.files && input.files[0];
+    input.value = '';
+    if (!f) return;
+    if (f.size > MAX_BYTES) { showMsg('ファイルが大きすぎます（15MBまで）', 'err'); return; }
+    setAudio(f);
+    $('timer').textContent = f.name;
+    $('recBtn').textContent = '録音';
+    showMsg('');
+    updateUI();
+  }
+
+  function setAudio(blob) {
+    audioBlob = blob;
+    const p = $('player');
+    p.src = URL.createObjectURL(blob);
+    p.hidden = false;
+  }
+
+  function resetAudio(resetLabel = true) {
+    audioBlob = null;
+    $('player').hidden = true;
+    $('player').removeAttribute('src');
+    $('timer').textContent = '0:00';
+    if (resetLabel) $('recBtn').textContent = '録音';
+  }
+
+  /* ---- 送信 ---- */
+  async function send() {
+    const staff = $('staff').value, venueCode = $('venue').value;
+    if (!staff || !venueCode || !audioBlob) return;
+    if (audioBlob.size > MAX_BYTES) { showMsg('音声が大きすぎます（15MBまで）', 'err'); return; }
+
+    busy = true; updateUI();
+    showMsg('送信・解析中です…（30秒ほどかかります。画面を閉じないでください）');
+
+    try {
+      const base64 = await toBase64(audioBlob);
+      const res = await fetch(GAS_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ key: KEY, staff, venueCode, mimeType: audioBlob.type, base64 }),
+      });
+      const r = await res.json();
+
+      if (r.error) throw new Error(r.error);
+      resetAudio();
+      if (r.ok) {
+        showMsg(`✅ 送信しました（${r.id}）\n\n【要約】${r.summary}\n【特記事項】${r.issues}\n【施設の声】${r.voices}件`, 'ok');
+      } else {
+        showMsg(r.message, 'err');
+      }
+    } catch (e) {
+      showMsg('送信に失敗しました：' + e.message + '\n録音は残っているので、もう一度「送信する」を押してください。', 'err');
+    } finally {
+      busy = false; updateUI();
+    }
+  }
+
+  function toBase64(blob) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result).split(',')[1]);
+      r.onerror = () => reject(new Error('音声の読み込みに失敗しました'));
+      r.readAsDataURL(blob);
+    });
+  }
+
+  /* ---- UI ---- */
+  function updateUI() {
+    const recording = recorder && recorder.state === 'recording';
+    $('recBtn').disabled = busy;
+    $('fileBtn').classList.toggle('disabled', busy || recording);
+    $('staff').disabled = busy;
+    $('venue').disabled = busy;
+    $('sendBtn').disabled = busy || recording || !audioBlob || !$('staff').value || !$('venue').value;
+    $('sendBtn').textContent = busy ? '送信中…' : '送信する';
+  }
+
+  function showMsg(text, cls) {
+    const el = $('msg');
+    el.textContent = text;
+    el.className = cls || '';
+  }
+
+  function fmt(sec) { return Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0'); }
+  function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+  function store(k, v) { try { localStorage.setItem('voiceReport_' + k, v); } catch (e) {} }
+  function load(k) { try { return localStorage.getItem('voiceReport_' + k); } catch (e) { return null; } }
+  function restore(id) {
+    const v = load(id);
+    if (v && [...$(id).options].some(o => o.value === v)) $(id).value = v;
+  }
+</script>
+</body>
+</html>
